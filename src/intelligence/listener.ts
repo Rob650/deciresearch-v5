@@ -92,16 +92,28 @@ export class TwitterListener {
   }
 
   private async pollTweets() {
+    const pollIntervalMs = 30 * 60 * 1000; // Poll every 30 minutes (conservative)
+    const batchSize = 5; // Process 5 accounts at a time
+    
     while (this.isRunning) {
       try {
-        for (const handle of TRACKED_ACCOUNTS) {
-          await this.fetchAndStoreTweets(handle);
+        // Batch accounts to reduce rate limit hits
+        for (let i = 0; i < TRACKED_ACCOUNTS.length; i += batchSize) {
+          const batch = TRACKED_ACCOUNTS.slice(i, i + batchSize);
+          await Promise.all(batch.map(h => this.fetchAndStoreTweets(h)));
+          
+          // Space out batches
+          if (i + batchSize < TRACKED_ACCOUNTS.length) {
+            await this.sleep(5 * 60 * 1000); // 5 min between batches
+          }
         }
-        // Poll every 5 minutes
-        await this.sleep(5 * 60 * 1000);
+        
+        // Wait before next full cycle
+        logger.info(`Poll cycle complete. Next in ${(pollIntervalMs / 60 / 1000).toFixed(0)} minutes`);
+        await this.sleep(pollIntervalMs);
       } catch (error: any) {
         logger.error('Polling error', error.message);
-        await this.sleep(60 * 1000); // Retry after 1 minute on error
+        await this.sleep(10 * 60 * 1000); // Backoff 10 minutes on error
       }
     }
   }
@@ -115,9 +127,8 @@ export class TwitterListener {
       });
 
       for (const tweet of tweets.data || []) {
-        // Extract sentiment and topics
-        const sentiment = await this.analyzeSentiment(tweet.text);
-        const topics = await this.extractTopics(tweet.text);
+        // Batch sentiment + topics into one call (consolidate LLM usage)
+        const { sentiment, topics } = await this.analyzeSentimentAndTopics(tweet.text);
 
         // Generate embedding (simplified - in production use OpenAI)
         const embedding = await this.generateEmbedding(tweet.text);
@@ -147,57 +158,62 @@ export class TwitterListener {
     }
   }
 
-  private async analyzeSentiment(text: string): Promise<'bullish' | 'bearish' | 'neutral'> {
+  private async analyzeSentimentAndTopics(
+    text: string
+  ): Promise<{ sentiment: 'bullish' | 'bearish' | 'neutral'; topics: string[] }> {
     try {
-      const message = await anthropic.messages.create({
-        model: 'claude-haiku-4-20250514',
-        max_tokens: 50,
-        messages: [
-          {
-            role: 'user',
-            content: `Classify sentiment as bullish, bearish, or neutral. Reply with one word only.\n\n"${text}"`
-          }
-        ]
-      });
-
-      const content =
-        message.content[0].type === 'text' ? message.content[0].text.toLowerCase() : 'neutral';
-
-      if (content.includes('bullish')) return 'bullish';
-      if (content.includes('bearish')) return 'bearish';
-      return 'neutral';
-    } catch (error: any) {
-      logger.warn('Sentiment analysis failed', error.message);
-      return 'neutral';
-    }
-  }
-
-  private async extractTopics(text: string): Promise<string[]> {
-    try {
+      // Batch both into one call to reduce API hits
       const message = await anthropic.messages.create({
         model: 'claude-haiku-4-20250514',
         max_tokens: 100,
         messages: [
           {
             role: 'user',
-            content: `Extract 2-4 key topics from this tweet. Reply with comma-separated words only.\n\n"${text}"`
+            content: `Analyze this tweet:
+1. Sentiment: bullish, bearish, or neutral (1 word)
+2. Topics: 2-4 key topics (comma-separated)
+
+Tweet: "${text}"
+
+Reply format:
+SENTIMENT: [word]
+TOPICS: [comma-separated]`
           }
         ]
       });
 
       const content = message.content[0].type === 'text' ? message.content[0].text : '';
-      return content.split(',').map(t => t.trim().toLowerCase());
+
+      // Parse response
+      const sentimentMatch = content.match(/SENTIMENT:\s*(\w+)/i);
+      const topicsMatch = content.match(/TOPICS:\s*([^\n]+)/i);
+
+      let sentiment: 'bullish' | 'bearish' | 'neutral' = 'neutral';
+      if (sentimentMatch) {
+        const s = sentimentMatch[1].toLowerCase();
+        if (s.includes('bullish')) sentiment = 'bullish';
+        else if (s.includes('bearish')) sentiment = 'bearish';
+      }
+
+      let topics: string[] = [];
+      if (topicsMatch) {
+        topics = topicsMatch[1]
+          .split(',')
+          .map(t => t.trim().toLowerCase())
+          .filter(t => t.length > 0);
+      }
+
+      return { sentiment, topics };
     } catch (error: any) {
-      logger.warn('Topic extraction failed', error.message);
-      return [];
+      logger.warn('Sentiment/topic analysis failed', error.message);
+      return { sentiment: 'neutral', topics: [] };
     }
   }
 
   private async generateEmbedding(text: string): Promise<number[]> {
-    // Simplified embedding - in production use OpenAI API
-    // For now, return a dummy vector
-    // Real implementation: const response = await openai.embeddings.create(...)
-    return Array(1536).fill(0); // Dummy 1536-dim vector (OpenAI embedding size)
+    // Use real OpenAI embeddings
+    const { embeddingsService } = await import('./embeddings.js');
+    return embeddingsService.embedText(text);
   }
 
   private sleep(ms: number): Promise<void> {
