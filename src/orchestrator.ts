@@ -12,6 +12,7 @@ import { twitterListener } from './intelligence/listener.js';
 import { classifier } from './intelligence/classifier.js';
 import { intelligenceComposer } from './intelligence/composer.js';
 import { vectorDB } from './intelligence/vectordb.js';
+import { discoveryScheduler } from './intelligence/discovery-scheduler.js';
 
 async function runAnalysis() {
   logger.info('=== Starting analysis run (with intelligence) ===');
@@ -67,6 +68,9 @@ async function startIntelligenceNetwork() {
   
   // Classify accounts
   await classifier.classifyAccounts();
+  
+  // Start discovery scheduler (finds new accounts automatically)
+  discoveryScheduler.start();
   
   // Update credibility scores periodically
   setInterval(async () => {
