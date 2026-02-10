@@ -4,35 +4,58 @@ Post smart crypto analysis to Twitter 4x per day, automatically.
 
 ## Features
 
-✨ **Core**
-- Fetches top 50 tokens by volume (CoinGecko + DEXScreener)
+✨ **Core Market Research**
+- Fetches top tokens by volume (CoinGecko + DEXScreener)
 - Deterministic scoring (volume, momentum, market cap)
-- Claude Haiku analysis (2 sentences per token)
+- Claude Haiku analysis (balanced takes on every token)
 - Automated posting 4x/day (6am, 12pm, 6pm, 10pm UTC)
+- Intelligence context: powered by 50+ credible accounts
+
+🧠 **Self-Expanding Intelligence Network**
+- Monitors 50+ tracked accounts 24/7
+- Auto-discovers new credible accounts from network mentions
+- LLM-powered categorization (TECHNICAL, NARRATIVE, SMART_MONEY, MARKET_STRUCTURE)
+- Smart approval gating (2-run confirmation before adding)
+- Semantic embeddings: every tweet searchable by meaning
+- RAG synthesis: tweets backed by collective intelligence
+
+💬 **Community Engagement**
+- Mentions listener: catches @deciresearch tags
+- Auto-reply engine: synthesizes answers from knowledge base
+- Account nomination system: community crowdsources research
+- Question answering: queries network for relevant context
 
 🛡️ **Safety & Reliability**
-- Scam detector (filters honeypots, new contracts, suspicious holders)
-- Tweet safety checks (banned phrases, uniqueness)
-- Automatic retry with exponential backoff
-- Circuit breaker pattern for failing services
-- Rate limiting (10 LLM calls/hour, 40 tweets/day)
+- Scam detector (honeypots, new contracts, extreme volatility)
+- Tweet safety checks (banned phrases, uniqueness, spacing)
+- Error recovery: automatic retry with exponential backoff + circuit breaker
+- Rate limiting: consolidated manager for all APIs
+- Comprehensive logging with early warnings at 80% usage
 
-📊 **Monitoring & Control**
-- REST API for metrics and health checks
-- CLI tool for manual control
-- Live ASCII dashboard
-- Tweet performance analytics
-- Real-time health metrics
+📊 **Monitoring & Insights**
+- Network health monitor (account distribution, credibility trends)
+- Insights API: query what network knows about any topic
+- REST API: `/health`, `/metrics`, `/dashboard`, `/discovery`
+- CLI tool: `status`, `metrics`, `config`, `db:*`
+- Real-time performance tracking
 
 ⚙️ **Configuration**
-- All settings configurable without code changes
-- Environment-based secrets
-- Per-run limits and thresholds
-- Feature flags (validation, analytics, dry-run mode)
+- All settings in code (no magic env vars beyond keys)
+- Per-component config (rate limits, discovery thresholds, schedules)
+- Feature flags (validation, analytics, dry-run)
+- Production setup guide (Supabase, deployment, troubleshooting)
 
 ## Quick Start
 
-### 1. Setup
+### 1. Production Setup
+**See [PRODUCTION_SETUP.md](./PRODUCTION_SETUP.md) for detailed deployment instructions** including:
+- Supabase database setup (with pgvector)
+- Environment variable configuration
+- Dry-run testing
+- VPS/Docker deployment options
+- Monitoring & troubleshooting
+
+### 2. Quick Start (Local Testing)
 ```bash
 # Clone and install
 gh repo clone Rob650/deciresearch-v5
@@ -41,21 +64,21 @@ npm install
 
 # Add your API keys
 cp .env.example .env
-# Edit .env with your keys
+# Edit .env with your Twitter, Anthropic, OpenAI, and Supabase keys
 ```
 
-### 2. Run
+### 3. Test Run
 ```bash
-# Start the bot
+# Start the bot (posts to Twitter on schedule)
 npm run dev
 
 # In another terminal, check status
 npm run cli status
 ```
 
-### 3. Monitor
+### 4. Monitor
 ```bash
-# View dashboard
+# View live dashboard
 curl http://localhost:3000/dashboard
 
 # Check metrics
