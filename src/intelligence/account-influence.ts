@@ -1,5 +1,15 @@
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { createClient } from '@supabase/supabase-js';
 import { vectorDB } from './vectordb.js';
 import { logger } from '../shared/logger.js';
+
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+const geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+
+const supabase = createClient(
+  process.env.SUPABASE_URL || '',
+  process.env.SUPABASE_KEY || ''
+);
 
 export interface IAccountInfluence {
   handle: string;
@@ -14,383 +24,296 @@ export interface IAccountInfluence {
   lastUpdated: number;
 }
 
-// Backwards compatibility alias
 export type AccountInfluence = IAccountInfluence;
 
+/**
+ * AccountInfluenceEngine - Uses Gemini 2.0 Flash for batch analysis
+ * Avoids Anthropic rate limits by offloading heavy analysis to Gemini
+ */
 export class AccountInfluenceEngine {
-  async scoreAccountInfluence(handle: string): Promise<IAccountInfluence | null> {
+  /**
+   * Batch score multiple accounts efficiently with Gemini
+   * Single API call for N accounts = 1/Nth the cost
+   */
+  async batchScoreInfluence(handles: string[]): Promise<Map<string, IAccountInfluence>> {
     try {
-      logger.info(`Scoring influence for @${handle}`);
+      logger.info(`Batch scoring ${handles.length} accounts with Gemini 2.0 Flash...`);
 
-      // Get base credibility
-      const baseCredibility = await this.getAccountCredibility(handle);
-      if (baseCredibility === null) {
-        return null;
-      }
-
-      // 1. Citation frequency (how often others mention/reply to them)
-      const citedByOthers = await this.countCitations(handle);
-
-      // 2. Conversation starter score (do their tweets get reply chains?)
-      const conversationStarter = await this.scoreConversationStarter(handle);
-
-      // 3. Early narratives (did they identify trends early?)
-      const earlyNarratives = await this.scoreEarlyNarratives(handle);
-
-      // 4. Accuracy score (how often were their takes correct in hindsight?)
-      const accuracy = await this.calculateAccuracy(handle);
-
-      // Calculate influence score with weighted formula
-      // (citedByOthers * 0.3) + (conversationStarter * 0.3) + (earlyNarratives * 0.25) + (accuracy * 0.15)
-      const influenceScore = Math.round(
-        citedByOthers * 0.3 +
-        conversationStarter * 0.3 +
-        earlyNarratives * 0.25 +
-        accuracy * 0.15
+      // Fetch recent tweets for context
+      const accountContext = await Promise.all(
+        handles.map(async h => {
+          const tweets = await vectorDB.getTweetsByAccount(h);
+          return {
+            handle: h,
+            recentTweets: tweets.slice(0, 3).map(t => `"${t.text.substring(0, 80)}..."`).join(' | '),
+            tweetCount: tweets.length
+          };
+        })
       );
 
-      // Determine momentum (trending up/down)
-      const momentum = await this.calculateMomentum(handle);
+      const contextStr = accountContext
+        .map(
+          ac =>
+            `@${ac.handle} (${ac.tweetCount} tweets): ${ac.recentTweets}`
+        )
+        .join('\n');
+
+      const prompt = `You are analyzing the influence of crypto researchers on Twitter.
+
+For each handle, score influence dimensions (0-100):
+1. Cited frequency: How often others quote/reference them
+2. Conversation starter: Do their tweets generate substantive reply chains?
+3. Early narratives: Do they identify trends before mainstream adoption?
+4. Prediction accuracy: Historical accuracy of their market/tech calls
+
+Return ONLY valid JSON (no markdown, no explanation):
+{
+  "@handle1": {
+    "cited": 80,
+    "starter": 75,
+    "early": 90,
+    "accuracy": 85
+  },
+  "@handle2": {
+    "cited": 60,
+    "starter": 55,
+    "early": 70,
+    "accuracy": 65
+  }
+}
+
+Account context:
+${contextStr}`;
+
+      const response = await geminiModel.generateContent(prompt);
+      const text = response.response.text();
+
+      const resultMap = new Map<string, IAccountInfluence>();
+
+      try {
+        const parsed = JSON.parse(text);
+
+        for (const [key, scores] of Object.entries(parsed) as any[]) {
+          const handle = key.replace('@', '');
+          const credibility = await this.getAccountCredibility(handle);
+
+          if (credibility !== null) {
+            // Calculate composite influence score
+            const influenceScore =
+              (scores.cited || 50) * 0.3 +
+              (scores.starter || 50) * 0.3 +
+              (scores.early || 50) * 0.25 +
+              (scores.accuracy || 50) * 0.15;
+
+            // Determine tier
+            let tier: 'trendsetter' | 'leader' | 'contributor' | 'follower' = 'contributor';
+            if (influenceScore >= 85) tier = 'trendsetter';
+            else if (influenceScore >= 70) tier = 'leader';
+            else if (influenceScore >= 55) tier = 'contributor';
+            else tier = 'follower';
+
+            const influence: IAccountInfluence = {
+              handle,
+              credibility,
+              influenceScore: Math.round(influenceScore),
+              citedByOthers: scores.cited || 50,
+              conversationStarter: scores.starter || 50,
+              earlyNarratives: scores.early || 50,
+              accuracy: scores.accuracy || 50,
+              momentum: 'stable',
+              tier,
+              lastUpdated: Date.now()
+            };
+
+            resultMap.set(handle, influence);
+
+            // Persist to DB
+            await this.persistInfluenceScore(influence);
+          }
+        }
+
+        logger.info(`Scored ${resultMap.size}/${handles.length} accounts successfully`);
+      } catch (e) {
+        logger.error('Failed to parse Gemini batch response', text);
+      }
+
+      return resultMap;
+    } catch (error: any) {
+      logger.error('Batch scoring failed', error.message);
+      return new Map();
+    }
+  }
+
+  /**
+   * Score a single account with Gemini + local metrics
+   */
+  async scoreAccountInfluence(handle: string): Promise<IAccountInfluence | null> {
+    try {
+      logger.info(`Scoring influence for @${handle} with Gemini...`);
+
+      const credibility = await this.getAccountCredibility(handle);
+      if (credibility === null) return null;
+
+      // Get recent tweets for context
+      const tweets = await vectorDB.getTweetsByAccount(handle);
+      const recentTweets = tweets.slice(0, 5);
+
+      const prompt = `Analyze the influence of crypto researcher @${handle}.
+
+Recent tweets (${recentTweets.length} samples):
+${recentTweets.map(t => `- "${t.text.substring(0, 100)}..." (${t.likes || 0}L, ${t.retweets || 0}RT)`).join('\n')}
+
+Score these dimensions (0-100):
+1. Citation frequency: How often do others quote/reference them?
+2. Conversation starter: Do their tweets generate substantive replies?
+3. Early narrative adoption: Do they identify trends ahead of crowd?
+4. Prediction accuracy: Historical accuracy of their calls?
+
+Return ONLY JSON (no explanation):
+{
+  "cited": <number>,
+  "starter": <number>,
+  "early": <number>,
+  "accuracy": <number>,
+  "reasoning": "<brief one-liner>"
+}`;
+
+      const response = await geminiModel.generateContent(prompt);
+      const text = response.response.text();
+
+      let scores = { cited: 50, starter: 50, early: 50, accuracy: 50 };
+      try {
+        const parsed = JSON.parse(text);
+        scores = {
+          cited: parsed.cited || 50,
+          starter: parsed.starter || 50,
+          early: parsed.early || 50,
+          accuracy: parsed.accuracy || 50
+        };
+      } catch (e) {
+        logger.warn(`Failed to parse Gemini response for @${handle}`);
+      }
+
+      // Composite influence score
+      const influenceScore =
+        scores.cited * 0.3 +
+        scores.starter * 0.3 +
+        scores.early * 0.25 +
+        scores.accuracy * 0.15;
 
       // Determine tier
-      let tier: 'trendsetter' | 'leader' | 'contributor' | 'follower' = 'follower';
-      if (influenceScore >= 80) tier = 'trendsetter';
-      else if (influenceScore >= 65) tier = 'leader';
-      else if (influenceScore >= 50) tier = 'contributor';
+      let tier: 'trendsetter' | 'leader' | 'contributor' | 'follower' = 'contributor';
+      if (influenceScore >= 85) tier = 'trendsetter';
+      else if (influenceScore >= 70) tier = 'leader';
+      else if (influenceScore >= 55) tier = 'contributor';
+      else tier = 'follower';
 
       const influence: IAccountInfluence = {
         handle,
-        credibility: baseCredibility,
-        influenceScore,
-        citedByOthers,
-        conversationStarter,
-        earlyNarratives,
-        accuracy,
-        momentum,
+        credibility,
+        influenceScore: Math.round(influenceScore),
+        citedByOthers: scores.cited,
+        conversationStarter: scores.starter,
+        earlyNarratives: scores.early,
+        accuracy: scores.accuracy,
+        momentum: 'stable',
         tier,
         lastUpdated: Date.now()
       };
 
-      logger.info(
-        `@${handle}: influence ${influenceScore}/100 (${tier}, ${momentum}), credibility ${baseCredibility}/100`
-      );
+      await this.persistInfluenceScore(influence);
       return influence;
     } catch (error: any) {
-      logger.error(`Failed to score influence for @${handle}`, error.message);
+      logger.error(`Failed to score @${handle}`, error.message);
       return null;
     }
   }
 
-  private async countCitations(handle: string): Promise<number> {
+  /**
+   * Persist influence scores to Supabase
+   */
+  private async persistInfluenceScore(influence: IAccountInfluence): Promise<boolean> {
     try {
-      // Get all tweets that mention this account
-      const categories = ['NARRATIVE', 'TECHNICAL', 'SMART_MONEY', 'MARKET_STRUCTURE'];
-      let citationCount = 0;
+      const { error } = await supabase
+        .from('account_influence')
+        .upsert(
+          {
+            handle: influence.handle,
+            credibility: influence.credibility,
+            influence_score: influence.influenceScore,
+            cited_count: influence.citedByOthers,
+            conversation_starter_score: influence.conversationStarter,
+            early_narrative_score: influence.earlyNarratives,
+            accuracy: influence.accuracy,
+            tier: influence.tier,
+            momentum: influence.momentum,
+            timestamp: influence.lastUpdated
+          },
+          { onConflict: 'handle' }
+        );
 
-      for (const category of categories) {
-        const accounts = await vectorDB.getAccountsByCategory(category);
-        for (const account of accounts) {
-          if (account.handle.toLowerCase() === handle.toLowerCase()) continue;
-
-          const tweets = await vectorDB.getTweetsByAccount(account.handle);
-          const citingTweets = tweets.filter(
-            t => t.text.toLowerCase().includes(`@${handle.toLowerCase()}`)
-          );
-          citationCount += citingTweets.length;
-        }
-      }
-
-      // Normalize to 0-100 scale (assume 0-50 is normal range)
-      return Math.min(100, (citationCount / 50) * 100);
+      if (error) throw error;
+      return true;
     } catch (error: any) {
-      logger.warn(`Failed to count citations for @${handle}`, error.message);
-      return 0;
+      logger.error(`Failed to persist score for ${influence.handle}`, error.message);
+      return false;
     }
   }
 
-  private async scoreConversationStarter(handle: string): Promise<number> {
-    try {
-      const tweets = await vectorDB.getTweetsByAccount(handle);
-
-      if (tweets.length === 0) return 0;
-
-      // Score based on reply count (more replies = conversation starter)
-      const avgReplies = tweets.reduce((sum, t) => sum + (t.replies || 0), 0) / tweets.length;
-      const avgLikes = tweets.reduce((sum, t) => sum + (t.likes || 0), 0) / tweets.length;
-
-      // Ratio of replies to likes indicates conversation
-      const replyRatio = avgLikes > 0 ? (avgReplies / avgLikes) * 100 : 0;
-
-      // Also consider total engagement
-      const avgEngagement = tweets.reduce((sum, t) => {
-        return sum + ((t.likes || 0) + (t.retweets || 0) + (t.replies || 0));
-      }, 0) / tweets.length;
-
-      // Normalize: good conversation starters get 30+ avg replies
-      const score = Math.min(100, ((avgReplies / 30) * 100 + replyRatio) / 2);
-
-      return Math.round(score);
-    } catch (error: any) {
-      logger.warn(`Failed to score conversation starter for @${handle}`, error.message);
-      return 0;
-    }
-  }
-
-  private async scoreEarlyNarratives(handle: string): Promise<number> {
-    try {
-      const tweets = await vectorDB.getTweetsByAccount(handle);
-
-      if (tweets.length === 0) return 0;
-
-      // Look for tweets that became major narratives later
-      const now = Date.now();
-      const oneWeekAgo = now - 7 * 24 * 60 * 60 * 1000;
-
-      // Get tweets from 2-4 weeks ago
-      const oldTweets = tweets.filter(
-        t => t.timestamp < oneWeekAgo && t.timestamp > oneWeekAgo - 14 * 24 * 60 * 60 * 1000
-      );
-
-      if (oldTweets.length === 0) return 50; // Default if not enough history
-
-      // Check if those themes are still being discussed
-      let earlyCalls = 0;
-      for (const oldTweet of oldTweets) {
-        for (const theme of oldTweet.topics || []) {
-          // Check if theme is still hot
-          // (In production, query if theme had >5 mentions last week)
-          earlyCalls++;
-        }
-      }
-
-      // Normalize: good early callers get 70%+ of their old themes continuing
-      const score = Math.min(100, (earlyCalls / Math.max(1, oldTweets.length)) * 100);
-
-      return Math.round(score);
-    } catch (error: any) {
-      logger.warn(`Failed to score early narratives for @${handle}`, error.message);
-      return 0;
-    }
-  }
-
-  private async calculateAccuracy(handle: string): Promise<number> {
-    try {
-      const tweets = await vectorDB.getTweetsByAccount(handle);
-
-      if (tweets.length < 5) return 50; // Not enough data
-
-      // Analyze bullish tweets from 30+ days ago
-      const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
-      const oldTweets = tweets.filter(t => t.timestamp < thirtyDaysAgo);
-
-      if (oldTweets.length === 0) return 50; // No old data
-
-      let correctCalls = 0;
-      for (const tweet of oldTweets) {
-        // If they said bullish and price went up, that's correct
-        // (Simplified: use engagement + retweets as proxy for validation)
-        if (tweet.sentiment === 'bullish' && (tweet.retweets || 0) > 10) {
-          correctCalls++;
-        }
-      }
-
-      const accuracy = (correctCalls / oldTweets.length) * 100;
-      return Math.round(Math.min(100, accuracy));
-    } catch (error: any) {
-      logger.warn(`Failed to calculate accuracy for @${handle}`, error.message);
-      return 50;
-    }
-  }
-
+  /**
+   * Get account credibility (from vectorDB categories)
+   */
   private async getAccountCredibility(handle: string): Promise<number | null> {
     try {
       const categories = ['NARRATIVE', 'TECHNICAL', 'SMART_MONEY', 'MARKET_STRUCTURE'];
       for (const category of categories) {
         const accounts = await vectorDB.getAccountsByCategory(category);
         const account = accounts.find(a => a.handle.toLowerCase() === handle.toLowerCase());
-        if (account) {
-          return account.credibilityScore;
-        }
+        if (account) return account.credibilityScore;
       }
-      return null;
-    } catch (error: any) {
-      logger.warn(`Failed to get credibility for @${handle}`, error.message);
+      return 50; // Default for untracked accounts
+    } catch {
       return null;
     }
   }
 
-  async getTrendsetters(limit: number = 5): Promise<AccountInfluence[]> {
+  /**
+   * Get top influencers across all tracked accounts
+   */
+  async getTopInfluencers(limit: number = 10): Promise<IAccountInfluence[]> {
     try {
-      const categories = ['NARRATIVE', 'TECHNICAL', 'SMART_MONEY', 'MARKET_STRUCTURE'];
-      const influences: AccountInfluence[] = [];
+      const { data } = await supabase
+        .from('account_influence')
+        .select('*')
+        .order('influence_score', { ascending: false })
+        .limit(limit);
 
-      for (const category of categories) {
-        const accounts = await vectorDB.getAccountsByCategory(category);
-        for (const account of accounts) {
-          const influence = await this.scoreAccountInfluence(account.handle);
-          if (influence && influence.tier === 'trendsetter') {
-            influences.push(influence);
-          }
-        }
-      }
-
-      return influences.sort((a, b) => b.influenceScore - a.influenceScore).slice(0, limit);
+      return (data || []) as IAccountInfluence[];
     } catch (error: any) {
-      logger.error('Failed to get trendsetters', error.message);
+      logger.error('Failed to get top influencers', error.message);
       return [];
     }
   }
 
-  private async calculateMomentum(handle: string): Promise<'rising' | 'stable' | 'declining'> {
+  /**
+   * Get influencers by tier
+   */
+  async getInfluencersByTier(
+    tier: 'trendsetter' | 'leader' | 'contributor' | 'follower'
+  ): Promise<IAccountInfluence[]> {
     try {
-      const tweets = await vectorDB.getTweetsByAccount(handle);
+      const { data } = await supabase
+        .from('account_influence')
+        .select('*')
+        .eq('tier', tier)
+        .order('influence_score', { ascending: false });
 
-      if (tweets.length < 10) return 'stable'; // Not enough data
-
-      // Split into two periods: last 2 weeks vs 2-4 weeks ago
-      const now = Date.now();
-      const twoWeeksAgo = now - 14 * 24 * 60 * 60 * 1000;
-      const fourWeeksAgo = now - 28 * 24 * 60 * 60 * 1000;
-
-      const recentTweets = tweets.filter(t => t.timestamp > twoWeeksAgo);
-      const oldTweets = tweets.filter(
-        t => t.timestamp < twoWeeksAgo && t.timestamp > fourWeeksAgo
-      );
-
-      if (recentTweets.length === 0 || oldTweets.length === 0) return 'stable';
-
-      // Calculate engagement for each period
-      const recentEngagement =
-        recentTweets.reduce((sum, t) => sum + ((t.likes || 0) + (t.retweets || 0)), 0) /
-        recentTweets.length;
-      const oldEngagement =
-        oldTweets.reduce((sum, t) => sum + ((t.likes || 0) + (t.retweets || 0)), 0) /
-        oldTweets.length;
-
-      // Determine momentum based on engagement trend
-      if (recentEngagement > oldEngagement * 1.3) return 'rising';
-      if (recentEngagement < oldEngagement * 0.7) return 'declining';
-      return 'stable';
+      return (data || []) as IAccountInfluence[];
     } catch (error: any) {
-      logger.warn(`Failed to calculate momentum for @${handle}`, error.message);
-      return 'stable';
-    }
-  }
-
-  async weightInsight(handle: string, baseWeight: number = 1): Promise<number> {
-    try {
-      const influence = await this.scoreAccountInfluence(handle);
-      if (!influence) return baseWeight;
-
-      // Weight formula: (influenceScore / 50) * baseWeight
-      // This ensures scores are normalized: 0-50 = 0-1x, 50-100 = 1-2x
-      const influenceMultiplier = influence.influenceScore / 50;
-      return baseWeight * influenceMultiplier;
-    } catch (error: any) {
-      logger.error(`Failed to weight insight from @${handle}`, error.message);
-      return baseWeight;
-    }
-  }
-
-  async weightInsightsByInfluence(insights: Array<{ handle: string; weight: number }>): Promise<Array<{ handle: string; weight: number }>> {
-    try {
-      // Weight insights by account influence score divided by 50 (normalized)
-      const weighted = await Promise.all(
-        insights.map(async insight => ({
-          handle: insight.handle,
-          weight: insight.weight * (await this.getInfluenceMultiplier(insight.handle))
-        }))
-      );
-      return weighted;
-    } catch (error: any) {
-      logger.error('Failed to weight insights by influence', error.message);
-      return insights;
-    }
-  }
-
-  private async getInfluenceMultiplier(handle: string): Promise<number> {
-    try {
-      const influence = await this.scoreAccountInfluence(handle);
-      if (!influence) return 1;
-      // Multiply by (influenceScore / 50) to scale influence
-      return Math.max(0.5, influence.influenceScore / 50);
-    } catch (error: any) {
-      return 1;
-    }
-  }
-
-  async rankByInfluence(handles: string[]): Promise<IAccountInfluence[]> {
-    try {
-      const scored = await Promise.all(
-        handles.map(async h => ({
-          handle: h,
-          influence: await this.scoreAccountInfluence(h)
-        }))
-      );
-
-      return scored
-        .filter(s => s.influence)
-        .sort((a, b) => (b.influence?.influenceScore || 0) - (a.influence?.influenceScore || 0))
-        .map(s => s.influence as IAccountInfluence);
-    } catch (error: any) {
-      logger.error('Failed to rank by influence', error.message);
+      logger.error(`Failed to get ${tier} influencers`, error.message);
       return [];
     }
-  }
-
-  async citeMostInfluential(handles: string[], limit: number = 3): Promise<string[]> {
-    try {
-      // Score all handles and return top ones for citation
-      const ranked = await this.rankByInfluence(handles);
-      return ranked.slice(0, limit).map(r => r.handle);
-    } catch (error: any) {
-      logger.error('Failed to cite most influential', error.message);
-      return handles.slice(0, limit);
-    }
-  }
-
-  async persistInfluenceScore(influence: IAccountInfluence): Promise<boolean> {
-    try {
-      // In production, persist to Supabase account_influence table
-      // INSERT OR UPDATE account_influence SET
-      // handle, credibility, influence_score, cited_count, conversation_starter_score,
-      // early_narrative_score, accuracy, momentum, tier, last_updated
-      logger.info(`Persisting influence score for @${influence.handle}: ${influence.influenceScore}/100`);
-      
-      // TODO: Implement Supabase persistence when database connection available
-      // For now, this is a placeholder that prevents errors
-      return true;
-    } catch (error: any) {
-      logger.warn(`Failed to persist influence score for @${influence.handle}`, error.message);
-      return false;
-    }
-  }
-
-  async batchPersistInfluenceScores(influences: IAccountInfluence[]): Promise<number> {
-    try {
-      let succeeded = 0;
-      for (const influence of influences) {
-        if (await this.persistInfluenceScore(influence)) {
-          succeeded++;
-        }
-      }
-      logger.info(`Persisted ${succeeded}/${influences.length} influence scores`);
-      return succeeded;
-    } catch (error: any) {
-      logger.error('Failed to batch persist influence scores', error.message);
-      return 0;
-    }
-  }
-
-  async detectCitations(handle: string): Promise<number> {
-    // Implemented as countCitations()
-    return this.countCitations(handle);
-  }
-
-  async detectEarlyAdopters(handle: string): Promise<number> {
-    // Implemented as scoreEarlyNarratives()
-    return this.scoreEarlyNarratives(handle);
   }
 }
 
-export const accountInfluence = new AccountInfluenceEngine();
+export const accountInfluenceEngine = new AccountInfluenceEngine();
