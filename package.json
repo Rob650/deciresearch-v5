@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "tsx src/orchestrator.ts",
     "build": "tsc",
-    "start": "node dist/orchestrator.js"
+    "start": "node dist/orchestrator.js",
+    "cli": "tsx src/cli.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
