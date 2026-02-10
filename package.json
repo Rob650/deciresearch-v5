@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
+    "@supabase/supabase-js": "^2.38.4",
     "better-sqlite3": "^11.8.1",
     "twitter-api-v2": "^1.17.2",
     "axios": "^1.7.9",
