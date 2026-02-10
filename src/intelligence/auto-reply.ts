@@ -1,6 +1,7 @@
 import { TwitterApi } from 'twitter-api-v2';
 import { ragEngine } from './rag.js';
 import { historicalContext } from './historical-context.js';
+import { accountInfluence } from './account-influence.js';
 import { logger } from '../shared/logger.js';
 import Anthropic from '@anthropic-ai/sdk';
 
@@ -29,12 +30,21 @@ export class AutoReplyEngine {
       // Get days since last analysis
       const daysSince = await historicalContext.getDaysSinceLastAnalysis(question);
 
-      // Build knowledge summary
+      // Build knowledge summary with influence-weighted citations
       let knowledge = '';
       if (ragContext.topAccounts.length > 0) {
+        // Sort by influence score (most influential first)
+        const handles = ragContext.topAccounts.map(a => a.handle);
+        const topByInfluence = await accountInfluence.citeMostInfluential(handles, 3);
+        
         knowledge += `Key insights from credible accounts:\n`;
-        for (const account of ragContext.topAccounts.slice(0, 3)) {
-          knowledge += `- @${account.handle} (${account.category})\n`;
+        for (const handle of topByInfluence) {
+          const account = ragContext.topAccounts.find(a => a.handle === handle);
+          if (account) {
+            const influence = await accountInfluence.scoreAccountInfluence(handle);
+            const tier = influence?.tier ? ` (${influence.tier})` : '';
+            knowledge += `- @${handle}${tier}\n`;
+          }
         }
       }
 
