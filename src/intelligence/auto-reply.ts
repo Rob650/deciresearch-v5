@@ -1,5 +1,6 @@
 import { TwitterApi } from 'twitter-api-v2';
 import { ragEngine } from './rag.js';
+import { historicalContext } from './historical-context.js';
 import { logger } from '../shared/logger.js';
 import Anthropic from '@anthropic-ai/sdk';
 
@@ -22,6 +23,12 @@ export class AutoReplyEngine {
       // Query knowledge base for relevant context
       const ragContext = await ragEngine.queryContext(question);
 
+      // Get historical context (how sentiment has evolved)
+      const historicalStr = await historicalContext.getContextString(question);
+
+      // Get days since last analysis
+      const daysSince = await historicalContext.getDaysSinceLastAnalysis(question);
+
       // Build knowledge summary
       let knowledge = '';
       if (ragContext.topAccounts.length > 0) {
@@ -39,8 +46,17 @@ export class AutoReplyEngine {
         knowledge += `\nSummary: ${ragContext.summary}\n`;
       }
 
+      // Add historical context
+      if (historicalStr) {
+        knowledge += `\nHistorical context: ${historicalStr}`;
+      }
+
+      if (daysSince !== null) {
+        knowledge += `Last covered ${daysSince} day${daysSince !== 1 ? 's' : ''} ago.\n`;
+      }
+
       // Compose reply using knowledge base
-      const prompt = `Based on this knowledge, reply to a question about crypto/DeFi. Be concise (1-2 sentences max), data-backed, and authoritative.
+      const prompt = `Based on this knowledge, reply to a question about crypto/DeFi. Include historical context if available to show how sentiment has evolved. Be concise (1-2 sentences max), data-backed, and authoritative.
 
 Question: "${question}"
 ${context ? `Context: ${context}` : ''}
