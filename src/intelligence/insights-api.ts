@@ -1,8 +1,9 @@
 import { ragEngine } from './rag.js';
 import { vectorDB } from './vectordb.js';
 import { networkHealth } from './network-health.js';
+import { accountInfluence } from './account-influence.js';
 import { logger } from '../shared/logger.js';
-import { RAGContext } from './types.js';
+import { RAGContext, TrackedAccount } from './types.js';
 
 export interface Insight {
   query: string;
@@ -17,10 +18,12 @@ export interface Insight {
     mentions: number;
     credibility: number;
   }>;
-  topAccounts: Array<{
+  topAccounts: TrackedAccount[];
+  topInfluencers: Array<{
     handle: string;
-    credibility: number;
-    category: string;
+    influenceScore: number;
+    tier: string;
+    momentum: string;
   }>;
   summary: string;
   confidence: number; // 0-100 based on data volume
@@ -54,6 +57,12 @@ export class InsightsAPI {
         logger.warn(`Low confidence insight for: ${query}`);
       }
 
+      // Get top influencers by account influence score
+      const topInfluencersList = await this.getTopInfluencers(
+        ragContext.topAccounts.map(a => a.handle),
+        5
+      );
+
       const insight: Insight = {
         query,
         sentiment: {
@@ -64,6 +73,7 @@ export class InsightsAPI {
         },
         topThemes: ragContext.themes,
         topAccounts: ragContext.topAccounts,
+        topInfluencers: topInfluencersList,
         summary: ragContext.summary,
         confidence: Math.round(confidence),
         timestamp: Date.now()
@@ -82,6 +92,7 @@ export class InsightsAPI {
         },
         topThemes: [],
         topAccounts: [],
+        topInfluencers: [],
         summary: 'Unable to generate insight. Try again later.',
         confidence: 0,
         timestamp: Date.now()
@@ -213,6 +224,33 @@ export class InsightsAPI {
         opinion: 'unknown',
         analysis: 'Unable to retrieve opinion'
       };
+    }
+  }
+
+  private async getTopInfluencers(
+    handles: string[],
+    limit: number = 5
+  ): Promise<
+    Array<{
+      handle: string;
+      influenceScore: number;
+      tier: string;
+      momentum: string;
+    }>
+  > {
+    try {
+      const influencers = await accountInfluence.rankByInfluence(handles);
+      return influencers
+        .slice(0, limit)
+        .map(inf => ({
+          handle: inf.handle,
+          influenceScore: inf.influenceScore,
+          tier: inf.tier,
+          momentum: inf.momentum
+        }));
+    } catch (error: any) {
+      logger.warn('Failed to get top influencers', error.message);
+      return [];
     }
   }
 

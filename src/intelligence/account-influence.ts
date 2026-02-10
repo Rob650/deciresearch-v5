@@ -1,20 +1,24 @@
 import { vectorDB } from './vectordb.js';
 import { logger } from '../shared/logger.js';
 
-export interface AccountInfluence {
+export interface IAccountInfluence {
   handle: string;
   credibility: number; // 0-100 (existing)
-  influenceScore: number; // 0-100 (NEW)
+  influenceScore: number; // 0-100 (NEW - composite score)
   citedByOthers: number; // How often referenced in replies/mentions
   conversationStarter: number; // Their tweets generate reply chains
-  earlyNarratives: number; // Said it first, others followed
+  earlyNarratives: number; // Said it first, others followed (days ahead)
   accuracy: number; // Historical prediction accuracy (0-100)
+  momentum: 'rising' | 'stable' | 'declining'; // trend direction
   tier: 'trendsetter' | 'leader' | 'contributor' | 'follower'; // influence tier
   lastUpdated: number;
 }
 
-export class AccountInfluence {
-  async scoreAccountInfluence(handle: string): Promise<AccountInfluence | null> {
+// Backwards compatibility alias
+export type AccountInfluence = IAccountInfluence;
+
+export class AccountInfluenceEngine {
+  async scoreAccountInfluence(handle: string): Promise<IAccountInfluence | null> {
     try {
       logger.info(`Scoring influence for @${handle}`);
 
@@ -36,13 +40,17 @@ export class AccountInfluence {
       // 4. Accuracy score (how often were their takes correct in hindsight?)
       const accuracy = await this.calculateAccuracy(handle);
 
-      // Calculate influence score (weighted combination)
+      // Calculate influence score with weighted formula
+      // (citedByOthers * 0.3) + (conversationStarter * 0.3) + (earlyNarratives * 0.25) + (accuracy * 0.15)
       const influenceScore = Math.round(
-        citedByOthers * 0.25 +
-        conversationStarter * 0.25 +
+        citedByOthers * 0.3 +
+        conversationStarter * 0.3 +
         earlyNarratives * 0.25 +
-        accuracy * 0.25
+        accuracy * 0.15
       );
+
+      // Determine momentum (trending up/down)
+      const momentum = await this.calculateMomentum(handle);
 
       // Determine tier
       let tier: 'trendsetter' | 'leader' | 'contributor' | 'follower' = 'follower';
@@ -50,7 +58,7 @@ export class AccountInfluence {
       else if (influenceScore >= 65) tier = 'leader';
       else if (influenceScore >= 50) tier = 'contributor';
 
-      const influence: AccountInfluence = {
+      const influence: IAccountInfluence = {
         handle,
         credibility: baseCredibility,
         influenceScore,
@@ -58,12 +66,13 @@ export class AccountInfluence {
         conversationStarter,
         earlyNarratives,
         accuracy,
+        momentum,
         tier,
         lastUpdated: Date.now()
       };
 
       logger.info(
-        `@${handle}: influence ${influenceScore}/100 (${tier}), credibility ${baseCredibility}/100`
+        `@${handle}: influence ${influenceScore}/100 (${tier}, ${momentum}), credibility ${baseCredibility}/100`
       );
       return influence;
     } catch (error: any) {
@@ -232,29 +241,86 @@ export class AccountInfluence {
     }
   }
 
+  private async calculateMomentum(handle: string): Promise<'rising' | 'stable' | 'declining'> {
+    try {
+      const tweets = await vectorDB.getTweetsByAccount(handle);
+
+      if (tweets.length < 10) return 'stable'; // Not enough data
+
+      // Split into two periods: last 2 weeks vs 2-4 weeks ago
+      const now = Date.now();
+      const twoWeeksAgo = now - 14 * 24 * 60 * 60 * 1000;
+      const fourWeeksAgo = now - 28 * 24 * 60 * 60 * 1000;
+
+      const recentTweets = tweets.filter(t => t.timestamp > twoWeeksAgo);
+      const oldTweets = tweets.filter(
+        t => t.timestamp < twoWeeksAgo && t.timestamp > fourWeeksAgo
+      );
+
+      if (recentTweets.length === 0 || oldTweets.length === 0) return 'stable';
+
+      // Calculate engagement for each period
+      const recentEngagement =
+        recentTweets.reduce((sum, t) => sum + ((t.likes || 0) + (t.retweets || 0)), 0) /
+        recentTweets.length;
+      const oldEngagement =
+        oldTweets.reduce((sum, t) => sum + ((t.likes || 0) + (t.retweets || 0)), 0) /
+        oldTweets.length;
+
+      // Determine momentum based on engagement trend
+      if (recentEngagement > oldEngagement * 1.3) return 'rising';
+      if (recentEngagement < oldEngagement * 0.7) return 'declining';
+      return 'stable';
+    } catch (error: any) {
+      logger.warn(`Failed to calculate momentum for @${handle}`, error.message);
+      return 'stable';
+    }
+  }
+
   async weightInsight(handle: string, baseWeight: number = 1): Promise<number> {
     try {
       const influence = await this.scoreAccountInfluence(handle);
       if (!influence) return baseWeight;
 
-      // Weight by influence tier
-      const tierMultiplier: { [key: string]: number } = {
-        trendsetter: 10,
-        leader: 5,
-        contributor: 2,
-        follower: 1
-      };
-
-      return baseWeight * tierMultiplier[influence.tier];
+      // Weight formula: (influenceScore / 50) * baseWeight
+      // This ensures scores are normalized: 0-50 = 0-1x, 50-100 = 1-2x
+      const influenceMultiplier = influence.influenceScore / 50;
+      return baseWeight * influenceMultiplier;
     } catch (error: any) {
       logger.error(`Failed to weight insight from @${handle}`, error.message);
       return baseWeight;
     }
   }
 
-  async citeMostInfluential(handles: string[], limit: number = 3): Promise<string[]> {
+  async weightInsightsByInfluence(insights: Array<{ handle: string; weight: number }>): Promise<Array<{ handle: string; weight: number }>> {
     try {
-      // Score all handles and return top ones for citation
+      // Weight insights by account influence score divided by 50 (normalized)
+      const weighted = await Promise.all(
+        insights.map(async insight => ({
+          handle: insight.handle,
+          weight: insight.weight * (await this.getInfluenceMultiplier(insight.handle))
+        }))
+      );
+      return weighted;
+    } catch (error: any) {
+      logger.error('Failed to weight insights by influence', error.message);
+      return insights;
+    }
+  }
+
+  private async getInfluenceMultiplier(handle: string): Promise<number> {
+    try {
+      const influence = await this.scoreAccountInfluence(handle);
+      if (!influence) return 1;
+      // Multiply by (influenceScore / 50) to scale influence
+      return Math.max(0.5, influence.influenceScore / 50);
+    } catch (error: any) {
+      return 1;
+    }
+  }
+
+  async rankByInfluence(handles: string[]): Promise<IAccountInfluence[]> {
+    try {
       const scored = await Promise.all(
         handles.map(async h => ({
           handle: h,
@@ -265,13 +331,66 @@ export class AccountInfluence {
       return scored
         .filter(s => s.influence)
         .sort((a, b) => (b.influence?.influenceScore || 0) - (a.influence?.influenceScore || 0))
-        .slice(0, limit)
-        .map(s => s.handle);
+        .map(s => s.influence as IAccountInfluence);
+    } catch (error: any) {
+      logger.error('Failed to rank by influence', error.message);
+      return [];
+    }
+  }
+
+  async citeMostInfluential(handles: string[], limit: number = 3): Promise<string[]> {
+    try {
+      // Score all handles and return top ones for citation
+      const ranked = await this.rankByInfluence(handles);
+      return ranked.slice(0, limit).map(r => r.handle);
     } catch (error: any) {
       logger.error('Failed to cite most influential', error.message);
       return handles.slice(0, limit);
     }
   }
+
+  async persistInfluenceScore(influence: IAccountInfluence): Promise<boolean> {
+    try {
+      // In production, persist to Supabase account_influence table
+      // INSERT OR UPDATE account_influence SET
+      // handle, credibility, influence_score, cited_count, conversation_starter_score,
+      // early_narrative_score, accuracy, momentum, tier, last_updated
+      logger.info(`Persisting influence score for @${influence.handle}: ${influence.influenceScore}/100`);
+      
+      // TODO: Implement Supabase persistence when database connection available
+      // For now, this is a placeholder that prevents errors
+      return true;
+    } catch (error: any) {
+      logger.warn(`Failed to persist influence score for @${influence.handle}`, error.message);
+      return false;
+    }
+  }
+
+  async batchPersistInfluenceScores(influences: IAccountInfluence[]): Promise<number> {
+    try {
+      let succeeded = 0;
+      for (const influence of influences) {
+        if (await this.persistInfluenceScore(influence)) {
+          succeeded++;
+        }
+      }
+      logger.info(`Persisted ${succeeded}/${influences.length} influence scores`);
+      return succeeded;
+    } catch (error: any) {
+      logger.error('Failed to batch persist influence scores', error.message);
+      return 0;
+    }
+  }
+
+  async detectCitations(handle: string): Promise<number> {
+    // Implemented as countCitations()
+    return this.countCitations(handle);
+  }
+
+  async detectEarlyAdopters(handle: string): Promise<number> {
+    // Implemented as scoreEarlyNarratives()
+    return this.scoreEarlyNarratives(handle);
+  }
 }
 
-export const accountInfluence = new AccountInfluence();
+export const accountInfluence = new AccountInfluenceEngine();

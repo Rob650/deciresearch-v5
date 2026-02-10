@@ -1,5 +1,6 @@
 import { Token } from '../shared/types.js';
 import { ragEngine } from './rag.js';
+import { accountInfluence } from './account-influence.js';
 import { logger } from '../shared/logger.js';
 import Anthropic from '@anthropic-ai/sdk';
 
@@ -18,7 +19,7 @@ export class IntelligenceComposer {
         topTokens.map(t => ragEngine.queryForTweet(t.symbol, 'market analysis'))
       );
 
-      // Build analysis brief from RAG insights
+      // Build analysis brief from RAG insights with influence weighting
       let brief = '📊 Market Pulse\n\n';
 
       for (let i = 0; i < topTokens.length; i++) {
@@ -31,8 +32,20 @@ export class IntelligenceComposer {
         brief += `24h: ${token.priceChange24h > 0 ? '+' : ''}${token.priceChange24h.toFixed(1)}%\n`;
         brief += `Volume: $${(token.volume24h / 1000000).toFixed(1)}M\n`;
 
+        // Weight themes by account influence
         if (context.themes.length > 0) {
           brief += `Key narrative: ${context.themes[0].theme}\n`;
+        }
+
+        // Add most influential sources
+        if (context.topAccounts.length > 0) {
+          const topInfluencerHandles = await accountInfluence.citeMostInfluential(
+            context.topAccounts.map(a => a.handle),
+            2
+          );
+          if (topInfluencerHandles.length > 0) {
+            brief += `Key sources: ${topInfluencerHandles.map(h => `@${h}`).join(', ')}\n`;
+          }
         }
 
         brief += `\n`;
@@ -133,13 +146,28 @@ Tweet:`;
       // Query vector DB for relevant context
       const ragContext = await ragEngine.queryContext(mention);
 
+      // Weight context by account influence
+      let knowledgeBase = ragContext.summary;
+      if (ragContext.topAccounts.length > 0) {
+        const topInfluencers = await accountInfluence.rankByInfluence(
+          ragContext.topAccounts.map(a => a.handle)
+        );
+        if (topInfluencers.length > 0) {
+          const citations = topInfluencers
+            .slice(0, 3)
+            .map((inf: any) => `@${inf.handle} (${inf.tier})`)
+            .join(', ');
+          knowledgeBase += `\nMost influential sources: ${citations}`;
+        }
+      }
+
       const prompt = `Reply to this Twitter mention using our knowledge base:
 
 Mention: "${mention}"
 Context: "${context}"
 
 Our knowledge (what credible accounts have said):
-${ragContext.summary}
+${knowledgeBase}
 
 Write a research-focused reply that sounds authoritative and informed. Use data where relevant. Max 280 characters.`;
 
