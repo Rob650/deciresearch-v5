@@ -10,6 +10,12 @@ export interface Token {
   score?: number;
   analysis?: string;
   timestamp: number;
+  // Validation fields
+  age?: number; // milliseconds since creation
+  volatility24h?: number; // percentage
+  liquidity?: number; // USD value of liquidity
+  topHolderPercent?: number; // percentage owned by largest holder
+  contractRenounced?: boolean;
 }
 
 export interface TweetContent {
